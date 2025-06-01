@@ -4,12 +4,16 @@ Unit tests for cli
 
 from __future__ import annotations
 
-import argparse
-
+# import argparse # Removed
+import click # Added
+from click.testing import CliRunner # Added
 import pytest
 from freezegun import freeze_time
 
 from pypistats import cli
+# Import the specific items to be tested if they are not top-level in cli module
+# For example, if YYYY_MM_DD_OPTIONAL is in pypistats.cli:
+# from pypistats.cli import YYYY_MM_DD_OPTIONAL, YYYY_MM, validate_python_major, validate_python_minor
 
 
 @pytest.mark.parametrize(
@@ -83,21 +87,81 @@ def test__month_name_to_yyyy_mm(name: str, date_format: str, expected: str) -> N
     # Assert
     assert expected == output
 
+# Test for failure case of _month_name_to_yyyy_mm
+@freeze_time("2019-05-08")
+def test__month_name_to_yyyy_mm_invalid():
+    with pytest.raises(ValueError) as excinfo:
+        cli._month_name_to_yyyy_mm("InvalidMonth", "%b")
+    assert "Could not parse month 'InvalidMonth' for current or previous year." in str(excinfo.value)
 
-@pytest.mark.parametrize("test_input", ["2018-01-12", "2018-07-12", "2018-12-12"])
-def test__valid_yyyy_mm_dd_valid(test_input: str) -> None:
-    assert test_input == cli._valid_yyyy_mm_dd(test_input)
+# Obsolete tests for _valid_yyyy_mm_dd, _valid_yyyy_mm, _valid_yyyy_mm_optional_dd are removed.
+# Obsolete tests for _define_format are removed.
+# Obsolete tests for _python_major_version and _python_minor_version helpers are removed.
+# __Args helper class is removed.
 
+# --- New tests for click custom types and callbacks ---
+runner = CliRunner()
 
-@pytest.mark.parametrize("test_input", ["asdfsdssd", "2018-99-99", "2018-xx"])
-def test__valid_yyyy_mm_dd_invalid(test_input: str) -> None:
-    with pytest.raises(argparse.ArgumentTypeError):
-        cli._valid_yyyy_mm_dd(test_input)
+# Helper command for testing date types
+@click.command()
+@click.option("--date1", type=cli.YYYY_MM_DD_OPTIONAL) # Assuming YYYY_MM_DD_OPTIONAL is accessible via cli module
+@click.option("--date2", type=cli.YYYY_MM) # Assuming YYYY_MM is accessible via cli module
+def check_date_types_command(date1, date2):
+    if date1: click.echo(f"date1:{date1}")
+    if date2: click.echo(f"date2:{date2}")
 
+@pytest.mark.parametrize("param_name, value, expected_output_part", [
+    ("--date1", "2023-10-25", "date1:2023-10-25"),
+    ("--date1", "2023-10", "date1:2023-10"),
+    pytest.param("--date1", "oct", "date1:2023-10", marks=freeze_time("2023-11-01")),
+    pytest.param("--date1", "dec", "date1:2022-12", marks=freeze_time("2023-01-15")),
+    ("--date2", "2023-09", "date2:2023-09"),
+    pytest.param("--date2", "sep", "date2:2023-09", marks=freeze_time("2023-10-01")),
+])
+def test_click_date_param_types_valid(param_name, value, expected_output_part):
+    result = runner.invoke(check_date_types_command, [param_name, value])
+    assert result.exit_code == 0, f"Output: {result.output}, Exception: {result.exception}"
+    assert expected_output_part in result.output
 
-@pytest.mark.parametrize("test_input", ["2018-01", "2018-07", "2018-12"])
-def test__valid_yyyy_mm_valid(test_input: str) -> None:
-    assert test_input == cli._valid_yyyy_mm(test_input)
+@pytest.mark.parametrize("param_name, value, expected_error_part", [
+    ("--date1", "2023-10-32", "not a valid yyyy-mm-dd"),
+    ("--date1", "2023-13", "not a valid yyyy-mm"),
+    ("--date1", "invalid-month-name", "not a valid yyyy-mm-dd"),
+    ("--date2", "2023-10-25", "not a valid yyyy-mm format"),
+    ("--date2", "invalid-month", "not a valid yyyy-mm format"),
+])
+def test_click_date_param_types_invalid(param_name, value, expected_error_part):
+    result = runner.invoke(check_date_types_command, [param_name, value])
+    assert result.exit_code != 0, "Command should have failed"
+    assert expected_error_part in result.output
+
+# Helper command for testing version callbacks
+@click.command()
+@click.option("--major", callback=cli.validate_python_major) # Assuming validate_python_major is accessible
+@click.option("--minor", callback=cli.validate_python_minor) # Assuming validate_python_minor is accessible
+def check_py_versions_command(major, minor):
+    if major: click.echo(f"major:{major}")
+    if minor: click.echo(f"minor:{minor}")
+
+@pytest.mark.parametrize("param_name, value, expected_output_part", [
+    ("--major", "3", "major:3"),
+    ("--minor", "3.10", "minor:3.10"),
+])
+def test_click_py_version_callbacks_valid(param_name, value, expected_output_part):
+    result = runner.invoke(check_py_versions_command, [param_name, value])
+    assert result.exit_code == 0, f"Output: {result.output}, Exception: {result.exception}"
+    assert expected_output_part in result.output
+
+@pytest.mark.parametrize("param_name, value, expected_error_part", [
+    ("--major", "3.1", "must be an integer"),
+    ("--major", "abc", "must be an integer"),
+    ("--minor", "3", "must be in X.Y format"),
+    ("--minor", "abc", "must be in X.Y format"),
+])
+def test_click_py_version_callbacks_invalid(param_name, value, expected_error_part):
+    result = runner.invoke(check_py_versions_command, [param_name, value])
+    assert result.exit_code != 0, "Command should have failed"
+    assert expected_error_part in result.output
 
 
 @freeze_time("2019-05-08")
@@ -119,86 +183,3 @@ def test__valid_yyyy_mm_valid_name(test_input: str, expected: str) -> None:
     assert expected == cli._valid_yyyy_mm(test_input)
 
 
-@pytest.mark.parametrize("test_input", ["dfkgjskfjgk", "2018-99", "2018-xx"])
-def test__valid_yyyy_mm_invalid(test_input: str) -> None:
-    with pytest.raises(argparse.ArgumentTypeError):
-        cli._valid_yyyy_mm(test_input)
-
-
-@pytest.mark.parametrize("test_input", ["2019-01-21", "2019-01"])
-def test__valid_yyyy_mm_optional_dd_valid(test_input: str) -> None:
-    assert test_input == cli._valid_yyyy_mm_optional_dd(test_input)
-
-
-@freeze_time("2019-05-08")
-@pytest.mark.parametrize(
-    "test_input, expected", [("jan", "2019-01"), ("february", "2019-02")]
-)
-def test__valid_yyyy_mm_optional_dd_valid_name(test_input: str, expected: str) -> None:
-    assert expected == cli._valid_yyyy_mm_optional_dd(test_input)
-
-
-@pytest.mark.parametrize("test_input", ["dkvnf", "2018-99", "2018-xx"])
-def test__valid_yyyy_mm_optional_dd_invalid(test_input: str) -> None:
-    with pytest.raises(argparse.ArgumentTypeError):
-        cli._valid_yyyy_mm_optional_dd(test_input)
-
-
-class __Args(argparse.Namespace):
-    def __init__(self, **kwargs) -> None:
-        super().__init__(**kwargs)
-        self.json = False  # type: bool
-        self.format = "markdown"  # type: str
-
-
-@pytest.mark.parametrize("test_input, expected", [(False, "markdown"), (True, "json")])
-def test__define_format_json_flag(test_input: bool, expected: str) -> None:
-    # Arrange
-    args = __Args()
-    args.json = test_input
-
-    # Act
-    _format = cli._define_format(args)
-
-    # Assert
-    assert expected == _format
-
-
-@pytest.mark.parametrize("test_input", ["json", "markdown"])
-def test__define_format_format_flag(test_input: str) -> None:
-    # Arrange
-    args = __Args()
-    args.json = False
-    args.format = test_input
-
-    # Act
-    _format = cli._define_format(args)
-
-    # Assert
-    assert test_input == _format
-
-
-@pytest.mark.parametrize("test_input", ["2", "3", "4"])
-def test__python_major_version_valid(test_input: str) -> None:
-    # Act / Assert
-    assert cli._python_major_version(test_input) == test_input
-
-
-@pytest.mark.parametrize("test_input", ["2.7", "3.9", "3.11", "-5", "pillow"])
-def test__python_major_version_invalid(test_input) -> None:
-    # Act / Assert
-    with pytest.raises(argparse.ArgumentTypeError):
-        cli._python_major_version(test_input)
-
-
-@pytest.mark.parametrize("test_input", ["2.7", "3.9", "3.11"])
-def test__python_minor_version_valid(test_input: str) -> None:
-    # Act / Assert
-    assert cli._python_minor_version(test_input) == test_input
-
-
-@pytest.mark.parametrize("test_input", ["2", "3", "4", "-5", "pillow"])
-def test__python_minor_version_invalid(test_input: str) -> None:
-    # Act / Assert
-    with pytest.raises(argparse.ArgumentTypeError):
-        cli._python_minor_version(test_input)

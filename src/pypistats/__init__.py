@@ -12,28 +12,40 @@ import sys
 import warnings
 from pathlib import Path
 
+import structlog
 from platformdirs import user_cache_dir
 from slugify import slugify
-from termcolor import colored
+# from termcolor import colored # Removed
+
+from rich.console import Console
+from rich.table import Table
+from rich.text import Text # For colored text
+import plotext
 
 from . import _version
+from .models import DownloadStatistic, RecentStats, PackageStats
+import cattrs
+
+# Basic structlog configuration for console output
+structlog.configure(
+    processors=[
+        structlog.stdlib.add_logger_name,
+        structlog.stdlib.add_log_level,
+        structlog.processors.StackInfoRenderer(),
+        structlog.dev.set_exc_info,
+        structlog.dev.ConsoleRenderer(),
+    ],
+    logger_factory=structlog.stdlib.LoggerFactory(),
+    wrapper_class=structlog.stdlib.BoundLogger,
+    cache_logger_on_first_use=True,
+)
+logger = structlog.get_logger(__name__)
 
 __version__ = _version.__version__
 
 BASE_URL = "https://pypistats.org/api/"
 CACHE_DIR = Path(user_cache_dir("pypistats"))
 USER_AGENT = f"pypistats/{__version__}"
-
-
-def _print_verbose(verbose: bool, *args, **kwargs) -> None:
-    """Print if verbose"""
-    if verbose:
-        _print_stderr(*args, **kwargs)
-
-
-def _print_stderr(*args, **kwargs) -> None:
-    """Print to stderr"""
-    print(*args, file=sys.stderr, **kwargs)
 
 
 def _cache_filename(url: str) -> Path:
@@ -97,12 +109,12 @@ def pypi_stats_api(
     end_date: str | None = None,
     sort: bool = True,
     total: str = "all",
-    color: str = "yes",
+    color_param: str = "auto", # Renamed from 'color', default from CLI
     verbose: bool = False,
 ):
     """Call the API and return JSON"""
     _validate_total(total)
-    if format == "md":
+    if format == "md": # click choices are case-insensitive, but internal logic might expect "markdown"
         format = "markdown"
     if params:
         params = "?" + params
@@ -110,319 +122,495 @@ def pypi_stats_api(
         params = ""
     url = BASE_URL + endpoint.lower() + params
     cache_file = _cache_filename(url)
-    _print_verbose(verbose, "API URL:", url)
-    _print_verbose(verbose, "Cache file:", cache_file)
+    if verbose: logger.debug("API URL", url=url)
+    if verbose: logger.debug("Cache file", path=str(cache_file))
 
-    res = {}
+    raw_api_response_dict = {} # Initialize
+
+    # Try loading from cache first
     if cache_file.is_file():
-        _print_verbose(verbose, "Cache file exists")
-        res = _load_cache(cache_file)
+        if verbose: logger.debug("Cache file exists, loading.", cache_file_path=str(cache_file))
+        raw_api_response_dict = _load_cache(cache_file)
+        if not raw_api_response_dict:
+            if verbose: logger.debug("Cache was empty or invalid.")
+            # If cache is invalid/empty, raw_api_response_dict remains {} or what _load_cache returned (e.g. {})
+            # This will trigger network fetch next.
 
-    if res == {}:
-        # No cache, or couldn't load cache
-        import httpx
+    if not raw_api_response_dict: # If not found in cache or cache was invalid
+        import httpx # Keep import here to avoid top-level if not always needed
+        if verbose: logger.debug("Fetching from network.", url=url)
 
-        r = httpx.get(url, headers={"User-Agent": USER_AGENT})
+        response = httpx.get(url, headers={"User-Agent": USER_AGENT})
 
-        # Raise if we made a bad request
-        # (4XX client error or 5XX server error response)
-        _print_verbose(verbose, "HTTP status code:", r.status_code)
-        r.raise_for_status()
+        if verbose:
+            logger.debug("HTTP status code received.", status_code=response.status_code, url=url)
+        response.raise_for_status() # Raise HTTP errors
 
-        res = r.json()
+        raw_api_response_dict = response.json()
+        _save_cache(cache_file, raw_api_response_dict) # Cache the raw dictionary
 
-        _save_cache(cache_file, res)
+    # Now, raw_api_response_dict contains the data as a dictionary.
+    # Check for empty or missing 'data' key before attempting to structure.
+    if not raw_api_response_dict or not raw_api_response_dict.get("data"):
+        package_name_for_msg = raw_api_response_dict.get("package", "") if raw_api_response_dict else ""
+        logger.warn("No data found for package in API response.", package_name=package_name_for_msg, api_url=url)
+        # This matches original behavior of returning a string message.
+        return f"No data found for https://pypi.org/project/{package_name_for_msg}/"
 
-    if not res.get("data", []):
-        return f"No data found for https://pypi.org/project/{res.get('package', '')}/"
+    # Initialize cattrs converter
+    converter = cattrs.Converter()
+
+    # Attempt to structure the raw dictionary into our attrs models
+    try:
+        # PackageStats is the top-level model. cattrs will use type hints
+        # on PackageStats.data (which is list[DownloadStatistic | RecentStats])
+        # to structure the items within the 'data' list.
+        structured_package_stats = converter.structure(raw_api_response_dict, PackageStats)
+    except Exception as e:
+        package_name_for_error = raw_api_response_dict.get("package", "unknown package")
+        logger.error(
+            "Failed to structure API response with cattrs.",
+            package_name=package_name_for_error,
+            error=str(e),
+            response_preview="".join(str(raw_api_response_dict)[:200].splitlines()), # Log a preview, remove newlines
+            api_url=url
+        )
+        # Mimic returning a string on error, similar to original behavior.
+        return f"Error processing API data for {package_name_for_error}: {str(e)}"
 
     # Actual first and last dates of the fetched data
-    first, last = _date_range(res["data"])
+    first, last = _date_range(structured_package_stats.data)
 
     # Validate end date
-    if end_date and end_date < first:
+    if end_date and first and end_date < first: # 'first' is from the new _date_range
         msg = (
             f"Requested end date ({end_date}) is before earliest available "
             f"data ({first}), because data is only available for 180 days. "
             "See https://pypistats.org/about#data"
         )
-        raise ValueError(msg)
+        raise ValueError(msg) # Or log error and return message
 
     # Validate start date
-    if start_date and start_date < first:
+    if start_date and first and start_date < first:
+        # Original used warnings.warn - keep this for now
         warnings.warn(
             f"Requested start date ({start_date}) is before earliest available "
             f"data ({first}), because data is only available for 180 days. "
             "See https://pypistats.org/about#data",
-            stacklevel=3,
+            stacklevel=3, # Keep original stacklevel if it was important
         )
 
+    # TODO: The following lines need to be updated to work with structured_package_stats.data
+    # For now, they will likely cause errors or not work as expected.
     if start_date or end_date:
-        res["data"] = _filter(res["data"], start_date, end_date)
+        structured_package_stats_data = _filter(structured_package_stats.data, start_date, end_date)
+        structured_package_stats.data = structured_package_stats_data
 
     if start_date:
         first = start_date
     if end_date:
         last = end_date
 
+    # The data to be processed by total, sort, percent, grand_total, etc.
+    # This will be a list of DownloadStatistic or RecentStats objects.
+    data_to_process = structured_package_stats.data
+
     if total == "monthly":
-        res["data"] = _monthly_total(res["data"])
+        # Filter for DownloadStatistic items before processing
+        stats_data = [s for s in data_to_process if isinstance(s, DownloadStatistic)]
+        data_to_process = _monthly_total(stats_data)
     elif total == "all":
-        res["data"] = _total(res["data"])
+        stats_data = [s for s in data_to_process if isinstance(s, DownloadStatistic)]
+        data_to_process = _total(stats_data)
+
+    # Update structured_package_stats.data with the processed data if necessary
+    # This is important if _monthly_total or _total change the list content/type
+    structured_package_stats.data = data_to_process
+
 
     if format == "json":
-        return json.dumps(res)
+        # If totals were applied, structured_package_stats.data might now be List[DownloadStatistic]
+        # even if original was List[RecentStats], ensure converter can handle this.
+        return json.dumps(converter.unstructure(structured_package_stats))
 
-    # These only for tables, like markdown and rst
-    data = res["data"]
+    # Data for tabulation is what we've processed so far
+    data_for_tabulation = data_to_process
     if sort:
-        data = _sort(data)
+        data_for_tabulation = _sort(data_for_tabulation)
 
-    data = _percent(data)
-    data = _grand_total(data)
+    # _percent and _grand_total expect list[DownloadStatistic]
+    # and modify/add to it.
+    # We need to ensure data_for_tabulation is of the correct type.
+    # If it was RecentStats and went through _total, it's now DownloadStatistic.
+    # If it was RecentStats and didn't go through _total, these might not apply or error.
+    if data_for_tabulation and isinstance(data_for_tabulation[0], DownloadStatistic):
+        # Cast to list[DownloadStatistic] for type checker, assuming homogeneity after processing
+        download_stats_for_tabulation = [ds for ds in data_for_tabulation if isinstance(ds, DownloadStatistic)]
+        download_stats_for_tabulation = _percent(download_stats_for_tabulation)
+        download_stats_for_tabulation = _grand_total(download_stats_for_tabulation)
+        data_for_tabulation = download_stats_for_tabulation
+    elif data_for_tabulation and isinstance(data_for_tabulation[0], RecentStats):
+        # _percent and _grand_total are not designed for RecentStats.
+        # Log or handle this case: maybe they shouldn't be called for RecentStats.
+        logger.info("Skipping percent and grand_total for RecentStats data type.")
 
-    if format is None:
-        return data
+    # 'color_param' is the color choice ('yes', 'no', 'auto') from CLI.
 
-    if color != "no" and format in ("markdown", "pretty", "rst", "tsv"):
-        data = _colourify(data)
+    # The variable 'data_for_tabulation' holds the list of attrs objects.
+    # 'format' is the requested output format string.
 
-    output = _tabulate(data, format, color)
+    if format is None: # Should not happen with Click default
+        return data_for_tabulation
 
-    if first and format not in ["numpy", "pandas"]:
+    output: str = "" # Initialize output
+
+    if format == "pretty":
+        force_terminal: bool | None = None
+        if color_param == "yes":
+            force_terminal = True
+        elif color_param == "no":
+            force_terminal = False
+
+        console = Console(force_terminal=force_terminal)
+        _tabulate_rich_pretty(data_for_tabulation, structured_package_stats.package, console)
+        return "" # Rich prints directly, return empty string
+
+    elif format in ("html", "markdown", "rst", "tsv"): # md is alias for markdown
+        if not data_for_tabulation:
+            return "No data to tabulate."
+
+        # Ensure converter is available
+        local_converter = cattrs.Converter() # Re-initialize if not passed or available in wider scope
+        try:
+            data_as_dicts = [local_converter.unstructure(item) for item in data_for_tabulation]
+        except Exception as e:
+            logger.error("Failed to unstructure data for pytablewriter", error=str(e))
+            return "Error preparing data for tabulation."
+
+        headers: list[str] = []
+        if data_as_dicts: # Ensure there's data before accessing first item
+            first_item_dict = data_as_dicts[0]
+            # Check the type of the original attrs object for correct header determination
+            original_first_item = data_for_tabulation[0]
+            if isinstance(original_first_item, DownloadStatistic):
+                headers = ["category", "date", "downloads"]
+                if "percent" in first_item_dict and first_item_dict["percent"] is not None:
+                    headers.append("percent")
+            elif isinstance(original_first_item, RecentStats):
+                headers = ["category", "last_day", "last_week", "last_month"]
+
+        # Use _pytablewriter for these formats
+        output = _pytablewriter(headers, data_as_dicts, format) # format is md, rst etc.
+
+    elif format == "plot":
+        force_terminal: bool | None = None
+        if color_param == "yes": force_terminal = True
+        elif color_param == "no": force_terminal = False
+        plot_console = Console(force_terminal=force_terminal)
+
+        download_stats_for_plot = [item for item in data_for_tabulation if isinstance(item, DownloadStatistic)]
+
+        if not download_stats_for_plot:
+            plot_console.print("[yellow]Warning: No data suitable for plotting (expected DownloadStatistic items).[/yellow]")
+            return "No data suitable for plotting."
+
+        _generate_plotext_plot(download_stats_for_plot, structured_package_stats.package, plot_console)
+        return "" # plotext prints directly
+
+    else:
+        logger.warn("Unknown or unhandled format requested for tabulation", requested_format=format)
+        return f"Format '{format}' not supported by this path."
+
+    # Add date range footer, similar to original logic
+    if first and format not in ["numpy", "pandas", "pretty", "plot"]: # "pretty" & "plot" are handled directly
         return f"{output}\nDate range: {first} - {last}\n"
     else:
-        return output
+        return output # For md, rst, tsv, html etc.
 
 
-def _filter(data, start_date=None, end_date=None):
-    """Only return data with dates between start_date and end_date"""
-    temp_data = []
+def _generate_plotext_plot(
+    data_list: list[DownloadStatistic], # Plotting is typically for DownloadStatistic
+    package_name: str,
+    console: Console # Rich console for printing any messages/errors around plotting
+) -> None: # plotext prints directly
+    """Generates and displays a terminal plot using plotext."""
+
+    if not data_list:
+        console.print(f"No data to plot for {package_name}.")
+        return
+
+    # Filter for DownloadStatistic instances and ensure they have valid dates and downloads
+    plot_data = []
+    for item in data_list:
+        if isinstance(item, DownloadStatistic) and hasattr(item, 'date') and isinstance(item.downloads, int):
+            try:
+                plot_data.append({'date': item.date, 'downloads': item.downloads, 'category': item.category})
+            except (ValueError, TypeError):
+                logger.warn("Skipping item with invalid date for plotting.", date_value=getattr(item, 'date', 'N/A'))
+                continue
+
+    if not plot_data:
+        console.print(f"No suitable data points found for plotting for {package_name}.")
+        return
+
+    # Sort data by date for time-series plotting
+    try:
+        plot_data.sort(key=lambda x: x['date'])
+    except TypeError as e:
+        logger.error("Failed to sort plot data by date.", error=str(e), first_date_example=plot_data[0]['date'] if plot_data else "N/A")
+        console.print("[red]Error: Could not sort data by date for plotting.[/red]")
+        return
+
+    categories = sorted(list(set(item['category'] for item in plot_data)))
+
+    plot_title = f"Download Stats for {package_name}"
+    if len(categories) == 1:
+        plot_title += f" ({categories[0]})"
+    elif len(categories) > 1:
+         plot_title += " (Multiple Categories)"
+
+    dates_str = [item['date'] for item in plot_data]
+    downloads_list = [item['downloads'] for item in plot_data] # Renamed to avoid conflict
+
+    plotext.clear_figure()
+    plotext.plot_date(dates_str, downloads_list)
+
+    plotext.title(plot_title)
+    plotext.xlabel("Date")
+    plotext.ylabel("Downloads")
+
+    plotext.show()
+
+def _filter(
+    data: list[DownloadStatistic | RecentStats],
+    start_date: str | None = None,
+    end_date: str | None = None
+) -> list[DownloadStatistic | RecentStats]:
+    """Only return data with dates between start_date and end_date."""
+    # This function primarily applies to DownloadStatistic objects which have a 'date'
+    filtered_data: list[DownloadStatistic | RecentStats] = []
+
+    current_data = data # Start with the original list
+
     if start_date:
-        for row in data:
-            if "date" in row and row["date"] >= start_date:
-                temp_data.append(row)
-        data = temp_data
+        processed_items: list[DownloadStatistic | RecentStats] = []
+        for item in current_data:
+            # Check if item is DownloadStatistic and has a date >= start_date
+            if isinstance(item, DownloadStatistic) and item.date >= start_date:
+                processed_items.append(item)
+            elif not isinstance(item, DownloadStatistic): # Keep non-DownloadStatistic items
+                processed_items.append(item)
+        current_data = processed_items # Update data to be the filtered list for the next step
 
-    temp_data = []
     if end_date:
-        for row in data:
-            if "date" in row and row["date"] <= end_date:
-                temp_data.append(row)
-        data = temp_data
+        processed_items: list[DownloadStatistic | RecentStats] = []
+        for item in current_data: # data is now potentially filtered by start_date
+            # Check if item is DownloadStatistic and has a date <= end_date
+            if isinstance(item, DownloadStatistic) and item.date <= end_date:
+                processed_items.append(item)
+            elif not isinstance(item, DownloadStatistic): # Keep non-DownloadStatistic items
+                processed_items.append(item)
+        current_data = processed_items # Update data with end_date filtering
 
+    return current_data
+
+
+def _sort(data: list[DownloadStatistic | RecentStats]) -> list[DownloadStatistic | RecentStats]:
+    """Sort by downloads. Handles items with 'downloads' or 'last_day' (for RecentStats)."""
+
+    if not data:
+        return []
+
+    # Determine sort key based on type of first element (assuming homogeneous list for sorting purposes)
+    # or check attributes.
+    if isinstance(data[0], DownloadStatistic):
+        # Sort DownloadStatistic items by 'downloads'
+        return sorted(data, key=lambda item: item.downloads if isinstance(item, DownloadStatistic) else 0, reverse=True)
+    elif isinstance(data[0], RecentStats):
+        # For RecentStats, 'last_day' might be a good proxy for "most recent downloads"
+        # The original API for 'recent' doesn't really have a 'downloads' field in the same way.
+        # Original _sort was generic for dicts with 'downloads'.
+        # Let's sort RecentStats by 'last_day' as a sensible default if sorting is applied.
+        return sorted(data, key=lambda item: item.last_day if isinstance(item, RecentStats) else 0, reverse=True)
+
+    # If it's a mixed list or unknown type, return as is or log a warning.
+    # For now, returning as is if type is not recognized for sorting.
+    logger.warn("Attempted to sort a list of unknown or mixed item types.", first_item_type=type(data[0]))
     return data
 
 
-def _sort(data: dict | list) -> dict | list:
-    """Sort by downloads"""
+def _monthly_total(data: list[DownloadStatistic]) -> list[DownloadStatistic]:
+    """Sum all downloads per category, by month, for DownloadStatistic items."""
+    totalled: dict[str, dict[str, int]] = {} # category -> {month_str -> total_downloads}
+    for item in data:
+        if not isinstance(item, DownloadStatistic): # Skip if not a DownloadStatistic
+            continue
 
-    # Only for lists of dicts, not a single dict
-    if isinstance(data, dict):
-        return data
+        category = item.category
+        downloads = item.downloads
+        month = item.date[:7] # Assumes date is YYYY-MM-DD
 
-    data = sorted(data, key=lambda k: k["downloads"], reverse=True)
-    return data
+        if category not in totalled:
+            totalled[category] = {}
 
+        totalled[category][month] = totalled[category].get(month, 0) + downloads
 
-def _monthly_total(data: list) -> list:
-    """Sum all downloads per category, by month"""
-
-    totalled: dict = {}
-    for row in data:
-        category = row["category"]
-        downloads = row["downloads"]
-        month = row["date"][:7]
-
-        if category in totalled:
-            if month in totalled[category]:
-                totalled[category][month] += downloads
-            else:
-                totalled[category][month] = downloads
-        else:
-            totalled[category] = {month: downloads}
-
-    data = []
+    new_data: list[DownloadStatistic] = []
     for category, month_downloads in totalled.items():
         for month, downloads in month_downloads.items():
-            data.append({"category": category, "date": month, "downloads": downloads})
+            new_data.append(DownloadStatistic(category=category, date=month, downloads=downloads))
 
-    return data
-
-
-def _total(data: dict | list) -> dict | list:
-    """Sum all downloads per category, regardless of date"""
-
-    # Only for lists of dicts, not a single dict
-    if isinstance(data, dict):
-        return data
-
-    totalled: dict = {}
-    for row in data:
-        try:
-            totalled[row["category"]] += row["downloads"]
-        except KeyError:
-            totalled[row["category"]] = row["downloads"]
-
-    data = []
-    for k, v in totalled.items():
-        data.append({"category": k, "downloads": v})
-
-    return data
+    return new_data
 
 
-def _date_range(data: dict | list) -> tuple[str | None, str | None]:
-    """Return the first and last dates in data"""
-    try:
-        first = data[0]["date"]
-        last = data[0]["date"]
-    except KeyError:
-        # /recent has no dates
+def _total(data: list[DownloadStatistic]) -> list[DownloadStatistic]:
+    """Sum all downloads per category, regardless of date, for DownloadStatistic items."""
+    totalled: dict[str, int] = {} # category -> total_downloads
+    for item in data:
+        if not isinstance(item, DownloadStatistic):
+            continue
+        totalled[item.category] = totalled.get(item.category, 0) + item.downloads
+
+    new_data: list[DownloadStatistic] = []
+    # The original _total returned items with 'category' and 'downloads', but no 'date'.
+    # To fit the DownloadStatistic model, we might need a different model or use a placeholder date.
+    # For now, let's use a placeholder date like "aggregated" or an empty string.
+    # This is a point that might need refinement based on how this data is used later.
+    for category, downloads in totalled.items():
+        new_data.append(DownloadStatistic(category=category, date="aggregated", downloads=downloads))
+
+
+    return new_data
+
+
+def _date_range(data: list[DownloadStatistic | RecentStats]) -> tuple[str | None, str | None]:
+    """Return the first and last dates in data if items have a 'date' attribute."""
+    # Filter out items that don't have a 'date' attribute (like RecentStats)
+    # or where 'date' might be None/empty string. Assumes 'date' is str if it exists.
+    dates = [item.date for item in data if hasattr(item, 'date') and isinstance(getattr(item, 'date', None), str) and getattr(item, 'date', None)]
+
+    if not dates:
         return None, None
-    for row in data:
-        date = row["date"]
-        if date < first:
-            first = date
-        elif date > last:
-            last = date
+
+    # Assuming date strings are in a comparable format like YYYY-MM-DD or YYYY-MM
+    first = min(dates)
+    last = max(dates)
 
     return first, last
 
 
-def _grand_total_value(data: list) -> int:
-    """Return the grand total of the data"""
-
-    # For "overall", without_mirrors is a subset of with_mirrors.
-    # Only sum with_mirrors.
-    if data[0]["category"] in ["with_mirrors", "without_mirrors"]:
+def _grand_total_value(data: list[DownloadStatistic]) -> int:
+    """Return the grand total of the data for DownloadStatistic items."""
+    # Original logic for "overall" with mirrors needs to be preserved.
+    # This means checking item.category values.
+    if data and isinstance(data[0], DownloadStatistic) and data[0].category in ["with_mirrors", "without_mirrors"]:
         count_with_mirrors = sum(
-            row["downloads"] for row in data if row["category"] == "with_mirrors"
+            item.downloads for item in data if isinstance(item, DownloadStatistic) and item.category == "with_mirrors"
         )
         count_without_mirrors = sum(
-            row["downloads"] for row in data if row["category"] == "without_mirrors"
+            item.downloads for item in data if isinstance(item, DownloadStatistic) and item.category == "without_mirrors"
         )
-        grand_total = max(count_with_mirrors, count_without_mirrors)
+        return max(count_with_mirrors, count_without_mirrors)
     else:
-        grand_total = sum(row["downloads"] for row in data)
+        return sum(item.downloads for item in data if isinstance(item, DownloadStatistic))
 
-    return grand_total
-
-
-def _grand_total(data: dict | list) -> dict | list:
-    """Add a grand total row"""
-
-    # Only for lists of dicts, not a single dict
-    if isinstance(data, dict):
-        return data
-
-    # No need when there's only one row
-    if len(data) == 1:
-        return data
+def _grand_total(data: list[DownloadStatistic]) -> list[DownloadStatistic]:
+    """Add a grand total row for DownloadStatistic items."""
+    if not data or not isinstance(data[0], DownloadStatistic) or len(data) == 1:
+        return data # No need or not applicable
 
     grand_total = _grand_total_value(data)
+    # Similar to _total, the "Total" row needs a date. Using "aggregated".
+    new_row = DownloadStatistic(category="Total", date="aggregated", downloads=grand_total)
 
-    new_row = {"category": "Total", "downloads": grand_total}
-    data.append(new_row)
-
-    return data
+    # Return a new list with the total row appended
+    return data + [new_row]
 
 
-def _percent(data: dict | list) -> dict | list:
-    """Add a percent column"""
-
-    # Only for lists of dicts, not a single dict
-    if isinstance(data, dict):
+def _percent(data: list[DownloadStatistic]) -> list[DownloadStatistic]:
+    """Add a percent value to each DownloadStatistic item. Modifies items in place."""
+    if not data or not isinstance(data[0], DownloadStatistic) or len(data) == 1:
         return data
 
-    # No need when there's only one row
-    if len(data) == 1:
+    grand_total = _grand_total_value(data) # Uses the updated one
+
+    if grand_total == 0: # Avoid division by zero
+        for item in data:
+            if isinstance(item, DownloadStatistic):
+                item.percent = "0.00%" # Or some other representation for zero total
         return data
 
-    grand_total = _grand_total_value(data)
+    for item in data:
+        if isinstance(item, DownloadStatistic):
+            # Ensure DownloadStatistic has a 'percent' attribute and is mutable
+            # This subtask assumes 'percent' field exists and model is mutable.
+            item.percent = "{:.2%}".format(item.downloads / grand_total)
 
-    for row in data:
-        row["percent"] = "{:.2%}".format(row["downloads"] / grand_total)
+def _tabulate_rich_pretty(
+    data_list: list[DownloadStatistic | RecentStats],
+    package_name: str, # For context if needed in title or header
+    console: Console # Pass a Rich Console configured with color system
+) -> None: # This function will print directly to the console
+    """Generates and prints a 'pretty' table using rich.table.Table."""
 
-    return data
+    if not data_list:
+        console.print(f"No data to display for {package_name}.")
+        return
 
+    table = Table(title=f"Stats for {package_name}", show_lines=True)
 
-def _colourify(data) -> list:
-    """Add colour to percentages:
-    red: 0% - 5%
-    yellow: 6% - 15%
-    green: 15% - 100%
-    """
+    # Determine headers from the type of the first item
+    # This assumes a list of homogeneous items, or that they share common fields for columns.
+    first_item = data_list[0]
+    headers: list[str] = []
 
-    for row in data:
-        if "percent" not in row:
-            continue
-        percent = float(row["percent"].rstrip("%"))
-        if percent <= 5:
-            colour = "red"
-        elif percent <= 15:
-            colour = "yellow"
-        else:
-            colour = "green"
-        row["percent"] = colored(row["percent"], colour)
-    return data
-
-
-def _tabulate(data: dict | list, format_: str = "markdown", color: str = "yes") -> str:
-    """Return data in specified format"""
-
-    if isinstance(data, dict):
-        headers = list(data.keys())
-    else:  # isinstance(data, list):
-        headers = sorted(set().union(*(d.keys() for d in data)))
-
-    # Move downloads last
-    headers.append("downloads")
-    headers.remove("downloads")
-
-    if format_ in ("markdown", "pretty"):
-        return _prettytable(headers, data, format_, color)
+    if isinstance(first_item, DownloadStatistic):
+        # Order matters for display
+        headers = ["category", "date", "downloads"]
+        if hasattr(first_item, 'percent') and first_item.percent is not None:
+            headers.append("percent")
+    elif isinstance(first_item, RecentStats):
+        headers = ["category", "last_day", "last_week", "last_month"]
     else:
-        return _pytablewriter(headers, data, format_)
-
-
-def _prettytable(
-    headers: list[str], data: dict | list, format_: str, color: str = "yes"
-) -> str:
-    from prettytable import PrettyTable, TableStyle
-
-    x = PrettyTable()
-    x.set_style(
-        TableStyle.MARKDOWN if format_ == "markdown" else TableStyle.SINGLE_BORDER
-    )
-
-    if isinstance(data, dict):
-        data = [data]
-
-    # Apply bold to header?
-    def h(header: str) -> str:
-        if color != "no" and format_ == "pretty":
-            return colored(header, attrs=["bold"])
-        return header
+        console.print("[red]Error: Unknown data type for table display.[/red]")
+        return
 
     for header in headers:
-        col_data = [row[header] if header in row else "" for row in data]
-        x.add_column(h(header), col_data)
+        table.add_column(header.replace("_", " ").title(), justify="right" if header not in ["category", "date"] else "left")
 
-    x.align[h("last_day")] = "r"
-    x.align[h("last_month")] = "r"
-    x.align[h("last_week")] = "r"
-    x.align[h("category")] = "l"
-    x.align[h("percent")] = "r"
-    x.align[h("downloads")] = "r"
-    x.custom_format[h("last_day")] = lambda f, v: f"{v:,}"
-    x.custom_format[h("last_month")] = lambda f, v: f"{v:,}"
-    x.custom_format[h("last_week")] = lambda f, v: f"{v:,}"
-    x.custom_format[h("downloads")] = lambda f, v: f"{v:,}"
+    for item in data_list:
+        row_values: list[str | Text] = []
+        for header in headers:
+            value = getattr(item, header, "")
 
-    return x.get_string() + "\n"
+            # Formatting and coloring
+            if header == "downloads" and isinstance(value, int):
+                value_str = f"{value:,}"
+            elif header == "last_day" and isinstance(value, int): # For RecentStats
+                value_str = f"{value:,}"
+            elif header == "last_week" and isinstance(value, int): # For RecentStats
+                value_str = f"{value:,}"
+            elif header == "last_month" and isinstance(value, int): # For RecentStats
+                value_str = f"{value:,}"
+            elif header == "percent" and isinstance(value, str):
+                # Apply color based on percentage value (example logic)
+                try:
+                    percent_val = float(value.rstrip('%'))
+                    if percent_val <= 5: style = "red"
+                    elif percent_val <= 15: style = "yellow"
+                    else: style = "green"
+                    value_str = Text(value, style=style)
+                except ValueError:
+                    value_str = str(value) # Fallback
+            else:
+                value_str = str(value)
 
+            row_values.append(value_str)
+        table.add_row(*row_values)
 
-def _pytablewriter(headers, data, format_: str):
+    console.print(table)
+
+def _pytablewriter(headers: list[str], data: list[dict], format_: str):
     from pytablewriter import (
         HtmlTableWriter,
         NumpyTableWriter,
