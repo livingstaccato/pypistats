@@ -1,45 +1,41 @@
 from __future__ import annotations
-
 from attrs import define, field
 
 @define
 class DownloadStatistic:
     """
-    Represents a single download statistic entry from the PyPI Stats API.
-    Typically found in endpoints like 'overall', 'python_major', etc.
+    Represents a single download statistic entry, typically part of a list
+    in API responses like 'overall', 'python_major', etc.
     """
     category: str
     date: str  # Dates are strings like "YYYY-MM-DD" or "YYYY-MM"
     downloads: int
-    percent: str | None = field(default=None, kw_only=True) # Added field
+    percent: str | None = field(default=None, kw_only=True) # For calculated percentages
 
 @define
-class RecentStats:
+class RecentAPIData:
     """
-    Represents download statistics for a recent period from the /recent endpoint.
-    The 'category' here is usually the package name itself.
+    Represents the structure of the 'data' field from the /recent API endpoint.
     """
-    category: str  # Or perhaps package_name: str for clarity? API uses "category".
     last_day: int
-    last_week: int
-    last_month: int
+    last_week: int | None = None # Optional, API varies based on 'period'
+    last_month: int | None = None # Optional
 
 @define
-class PackageStats:
-    """
-    Represents the overall structure often returned by the API,
-    containing package information and a list of data points.
-    """
+class BasePackageAPIResponse: # Common fields
     package: str
-    data: list[DownloadStatistic | RecentStats] # Using a union for flexibility
-    # Depending on the endpoint, 'data' items could be DownloadStatistic or other types.
-    # For 'recent', the 'data' list contains a single item that looks more like RecentStats
-    # but is often a dictionary with 'category' (package name), 'last_day', etc.
-    # Let's refine this if direct usage shows issues.
+    type: str # e.g., "overall_downloads", "recent_downloads"
 
-# We might need more specific container types later, e.g., for how 'recent'
-# structures its full response if it differs significantly at the top level.
-# The API returns a dict with 'package', 'type', 'data' (list of dicts)
-# For 'recent', data is a list containing ONE dict:
-# {'category': 'pypistats', 'last_day': 123, 'last_month': 4567, 'last_week': 890}
-# So, perhaps RecentStats is the structure within the list for the 'recent' endpoint.
+@define
+class OverallPackageStats(BasePackageAPIResponse):
+    """
+    Represents the structured API response for 'overall', 'python_major', 'python_minor', 'system'.
+    """
+    data: list[DownloadStatistic]
+
+@define
+class RecentPackageStats(BasePackageAPIResponse):
+    """
+    Represents the structured API response for the 'recent' endpoint.
+    """
+    data: RecentAPIData

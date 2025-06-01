@@ -19,7 +19,7 @@ keywords = [
 license = "MIT"
 license-files = [ "LICENSE.txt" ]
 authors = [ { name = "Hugo van Kemenade" } ]
-requires-python = ">=3.13"
+requires-python = ">=3.10"
 classifiers = [
   "Development Status :: 5 - Production/Stable",
   "Intended Audience :: Developers",
@@ -39,13 +39,14 @@ dependencies = [
   "httpx>=0.19",
   "plotext",
   "platformdirs",
-  "prettytable>=3.12",
-  "pytablewriter[html]>=0.63",
+  "prettytable>=3.12", # Kept as per user's version
+  "pytablewriter[html]>=0.63", # Kept
   "python-dateutil",
   "python-slugify",
   "rich",
   "structlog",
-  "termcolor>=2.1",
+  "termcolor>=2.1", # Kept
+  "respx>=0.22.0", # Added
 ]
 optional-dependencies.numpy = [
   "numpy",
@@ -57,7 +58,7 @@ optional-dependencies.tests = [
   "freezegun",
   "pytest",
   "pytest-cov",
-  "respx>=0.11",
+  "respx>=0.11", # This was already here, user added a root dep too
 ]
 urls.Changelog = "https://github.com/hugovk/pypistats/releases"
 urls.Homepage = "https://github.com/hugovk/pypistats"
@@ -119,3 +120,10 @@ filterwarnings = [
   "ignore:sys.monitoring isn't available, using default core:coverage.exceptions.CoverageWarning",
 ]
 testpaths = [ "tests" ]
+
+[dependency-groups] # Corrected TOML table array name
+dev = [
+    "freezegun>=1.5.2",
+    "pytest>=8.3.5",
+    "pytest-cov>=6.1.1",
+]

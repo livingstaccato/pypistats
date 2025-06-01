@@ -143,16 +143,16 @@ def cli(ctx, verbose: bool, color: str):
     # For now, verbose is passed to API calls.
 
 # Helper for date processing common to multiple commands
-def process_date_inputs(start_date_in, end_date_in, month_in, last_month_flag, this_month_flag):
+def process_date_inputs(start_date_in, end_date_in, month_in, last_month, this_month):
     # This function takes the string inputs from Click options (which can be yyyy-mm or yyyy-mm-dd)
     # and resolves them to specific yyyy-mm-dd start and end dates for the API.
     s_date, e_date = start_date_in, end_date_in
 
     if month_in: # User specified --month yyyy-mm (already validated by YYYY_MM type)
         s_date, e_date = _month(month_in)
-    elif last_month_flag:
+    elif last_month: # Use the corrected parameter name
         s_date, e_date = _last_month()
-    elif this_month_flag:
+    elif this_month: # Use the corrected parameter name
         s_date = _this_month() # yyyy-mm-dd
         e_date = None # API handles None as "up to most recent"
 
@@ -215,10 +215,10 @@ def recent(ctx, package: str, period: str | None, format: str):
 @click.pass_context
 def overall(ctx, package: str, mirrors: str | None,
             start_date_in: str | None, end_date_in: str | None, month_in: str | None,
-            last_month_flag: bool, this_month_flag: bool,
-            daily: bool, monthly: bool, format: str):
+            last_month: bool, this_month: bool, # Corrected parameter names
+            daily: bool, monthly: bool, format: str): # daily, monthly already correct
     """Daily/monthly downloads over a period."""
-    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month_flag, this_month_flag)
+    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month, this_month) # Pass corrected names
 
     mirrors_param: bool | None = None
     if mirrors:
@@ -227,7 +227,7 @@ def overall(ctx, package: str, mirrors: str | None,
         elif mirrors == "true": mirrors_param = True
         elif mirrors == "false": mirrors_param = False
 
-    total_granularity = "daily" if daily else ("monthly" if monthly else "all")
+    total_granularity = "daily" if daily else ("monthly" if monthly else "all") # daily, monthly already correct
 
     output = pypistats.overall(
         package=package,
@@ -249,11 +249,11 @@ def overall(ctx, package: str, mirrors: str | None,
 @click.pass_context
 def python_major(ctx, package: str, py_version: str | None,
                  start_date_in: str | None, end_date_in: str | None, month_in: str | None,
-                 last_month_flag: bool, this_month_flag: bool,
-                 daily: bool, monthly: bool, format: str):
+                 last_month: bool, this_month: bool, # Corrected parameter names
+                 daily: bool, monthly: bool, format: str): # daily, monthly already correct
     """Daily/monthly downloads by Python major version."""
-    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month_flag, this_month_flag)
-    total_granularity = "daily" if daily else ("monthly" if monthly else "all")
+    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month, this_month) # Pass corrected names
+    total_granularity = "daily" if daily else ("monthly" if monthly else "all") # daily, monthly already correct
     output = pypistats.python_major(
         package=package,
         version=py_version,
@@ -274,11 +274,11 @@ def python_major(ctx, package: str, py_version: str | None,
 @click.pass_context
 def python_minor(ctx, package: str, py_version: str | None,
                  start_date_in: str | None, end_date_in: str | None, month_in: str | None,
-                 last_month_flag: bool, this_month_flag: bool,
-                 daily: bool, monthly: bool, format: str):
+                 last_month: bool, this_month: bool, # Corrected parameter names
+                 daily: bool, monthly: bool, format: str): # daily, monthly already correct
     """Daily/monthly downloads by Python minor version."""
-    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month_flag, this_month_flag)
-    total_granularity = "daily" if daily else ("monthly" if monthly else "all")
+    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month, this_month) # Pass corrected names
+    total_granularity = "daily" if daily else ("monthly" if monthly else "all") # daily, monthly already correct
     output = pypistats.python_minor(
         package=package,
         version=py_version,
@@ -299,11 +299,11 @@ def python_minor(ctx, package: str, py_version: str | None,
 @click.pass_context
 def system(ctx, package: str, operating_system: str | None,
            start_date_in: str | None, end_date_in: str | None, month_in: str | None,
-           last_month_flag: bool, this_month_flag: bool,
-           daily: bool, monthly: bool, format: str):
+           last_month: bool, this_month: bool, # Corrected parameter names
+           daily: bool, monthly: bool, format: str): # daily, monthly already correct
     """Daily/monthly downloads by Operating System."""
-    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month_flag, this_month_flag)
-    total_granularity = "daily" if daily else ("monthly" if monthly else "all")
+    start_date, end_date = process_date_inputs(start_date_in, end_date_in, month_in, last_month, this_month) # Pass corrected names
+    total_granularity = "daily" if daily else ("monthly" if monthly else "all") # daily, monthly already correct
     output = pypistats.system(
         package=package,
         os=operating_system,

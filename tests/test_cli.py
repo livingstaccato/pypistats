@@ -113,10 +113,10 @@ def check_date_types_command(date1, date2):
 @pytest.mark.parametrize("param_name, value, expected_output_part", [
     ("--date1", "2023-10-25", "date1:2023-10-25"),
     ("--date1", "2023-10", "date1:2023-10"),
-    pytest.param("--date1", "oct", "date1:2023-10", marks=freeze_time("2023-11-01")),
-    pytest.param("--date1", "dec", "date1:2022-12", marks=freeze_time("2023-01-15")),
+    pytest.param("--date1", "oct", "date1:2023-10", marks=[pytest.mark.freeze_time("2023-11-01")]),
+    pytest.param("--date1", "dec", "date1:2022-12", marks=[pytest.mark.freeze_time("2023-01-15")]),
     ("--date2", "2023-09", "date2:2023-09"),
-    pytest.param("--date2", "sep", "date2:2023-09", marks=freeze_time("2023-10-01")),
+    pytest.param("--date2", "sep", "date2:2023-09", marks=[pytest.mark.freeze_time("2023-10-01")]),
 ])
 def test_click_date_param_types_valid(param_name, value, expected_output_part):
     result = runner.invoke(check_date_types_command, [param_name, value])

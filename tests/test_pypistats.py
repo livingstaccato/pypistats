@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 import respx
-from termcolor import termcolor
+# from termcolor import termcolor # Removed
 
 import pypistats
 
@@ -77,11 +77,12 @@ class TestPypiStats:
         # Unstub caching
         pypistats._cache_filename = self.original__cache_filename
         pypistats._save_cache = self.original__save_cache
-        try:
-            # termcolor 3.1+
-            termcolor._can_do_colour.cache_clear()
-        except AttributeError:
-            pass
+        # Removed termcolor cache clearing from teardown
+        # try:
+        #     # termcolor 3.1+
+        #     termcolor._can_do_colour.cache_clear()
+        # except AttributeError:
+        #     pass
 
     def test__filter_no_filters_no_change(self) -> None:
         # Arrange
@@ -203,31 +204,7 @@ class TestPypiStats:
         # Assert
         assert param == expected
 
-    def test__colourify(self, monkeypatch) -> None:
-        # Arrange
-        data = [
-            {"category": "2.7", "downloads": 1},
-            {"category": "3.5", "downloads": 10},
-            {"category": "3.10", "downloads": 89},
-        ]
-        expected_output = [
-            # red
-            {"category": "2.7", "downloads": 1, "percent": "\x1b[31m1.00%\x1b[0m"},
-            # yellow
-            {"category": "3.5", "downloads": 10, "percent": "\x1b[33m10.00%\x1b[0m"},
-            # green
-            {"category": "3.10", "downloads": 89, "percent": "\x1b[32m89.00%\x1b[0m"},
-            {"category": "Total", "downloads": 100},
-        ]
-        percent_data = pypistats._percent(data)
-        total_data = pypistats._grand_total(percent_data)
-        monkeypatch.setenv("FORCE_COLOR", "1")
-
-        # Act
-        output = pypistats._colourify(total_data)
-
-        # Assert
-        assert output == expected_output
+    # test__colourify removed as _colourify function was deleted from pypistats/__init__.py
 
     def test__tabulate_noarg(self) -> None:
         # Arrange
